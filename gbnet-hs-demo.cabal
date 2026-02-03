@@ -1,0 +1,24 @@
+cabal-version:      3.0
+name:               gbnet-hs-demo
+version:            0.1.0.0
+synopsis:           Visual demo for gbnet-hs networking library
+license:            MIT
+author:             Devon Tomlin
+build-type:         Simple
+
+-- Single P2P demo executable
+-- Run multiple instances to see them connect
+executable gbnet-demo
+  main-is:          Main.hs
+  other-modules:    Game
+  hs-source-dirs:   src
+  build-depends:
+      base >= 4.16 && < 5
+    , gbnet-hs
+    , bytestring
+    , text
+    , gloss
+    , containers
+    , time
+  default-language: Haskell2010
+  ghc-options:      -Wall -threaded

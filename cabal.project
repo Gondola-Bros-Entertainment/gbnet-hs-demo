@@ -1,0 +1,4 @@
+packages: .
+
+-- Reference local gbnet-hs library
+optional-packages: ../gbnet-hs/gbnet-hs.cabal
