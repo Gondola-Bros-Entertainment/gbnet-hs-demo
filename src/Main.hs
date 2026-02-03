@@ -126,43 +126,40 @@ main = do
             ncMaxPacketRate = 1000.0
           }
 
-  -- Create network state using the new API
-  netStateResult <- initNetState bindAddr
-  case netStateResult of
-    Left err -> error $ "Failed to create socket: " ++ show err
-    Right netState -> do
-      now <- getMonoTimeIO
+  -- Create peer (newPeer creates the socket)
+  now <- getMonoTimeIO
+  peerResult <- newPeer bindAddr config now
+  case peerResult of
+    Left err -> error $ "Failed to create peer: " ++ show err
+    Right (peer, sock) -> do
+      -- Create NetState from the peer's socket
+      let netState = newNetState sock (npLocalAddr peer)
 
-      -- Create peer (newPeer returns IO)
-      peerResult <- newPeer bindAddr config now
-      case peerResult of
-        Left err -> error $ "Failed to create peer: " ++ show err
-        Right (peer, _sock) -> do
-          -- Connect to target if specified
-          let peer' = case connectTo of
-                Nothing -> peer
-                Just targetPort ->
-                  let targetAddr = SockAddrInet (fromIntegral targetPort) (tupleToHostAddress (127, 0, 0, 1))
-                      targetPid = peerIdFromAddr targetAddr
-                   in peerConnect targetPid now peer
+      -- Connect to target if specified
+      let peer' = case connectTo of
+            Nothing -> peer
+            Just targetPort ->
+              let targetAddr = SockAddrInet (fromIntegral targetPort) (tupleToHostAddress (127, 0, 0, 1))
+                  targetPid = peerIdFromAddr targetAddr
+               in peerConnect targetPid now peer
 
-          -- Shared state between network thread and render thread
-          localStateRef <- newIORef defaultPlayerState
-          sharedNetRef <- newIORef (SharedNetState Map.empty 0)
-          peerRef <- newIORef peer'
+      -- Shared state between network thread and render thread
+      localStateRef <- newIORef defaultPlayerState
+      sharedNetRef <- newIORef (SharedNetState Map.empty 0)
+      peerRef <- newIORef peer'
 
-          -- Start network thread with new polymorphic API
-          _ <- forkIO $ networkThread localStateRef sharedNetRef peerRef netState
+      -- Start network thread with new polymorphic API
+      _ <- forkIO $ networkThread localStateRef sharedNetRef peerRef netState
 
-          -- Run gloss on main thread
-          playIO
-            (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
-            (makeColorI 25 25 38 255)
-            60
-            (initialDemoState localPort)
-            (render sharedNetRef)
-            handleInput
-            (update localStateRef sharedNetRef)
+      -- Run gloss on main thread
+      playIO
+        (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
+        (makeColorI 25 25 38 255)
+        60
+        (initialDemoState localPort)
+        (render sharedNetRef)
+        handleInput
+        (update localStateRef sharedNetRef)
 
 -- | Network thread wrapper that handles exceptions.
 networkThread :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetState -> IO ()
