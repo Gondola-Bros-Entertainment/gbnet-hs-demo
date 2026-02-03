@@ -14,6 +14,7 @@
 module Main where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (SomeException, catch)
 import Control.Monad (foldM)
 import Data.IORef
 import Data.Map.Strict (Map)
@@ -21,7 +22,8 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word16, Word8)
-import GBNet.Config (defaultNetworkConfig)
+import GBNet.Channel (ChannelConfig (..), DeliveryMode (..), defaultChannelConfig)
+import GBNet.Config (NetworkConfig (..), defaultNetworkConfig)
 import GBNet.Peer
 import GBNet.Reliability (MonoTime)
 import GBNet.Serialize.BitBuffer (ReadResult (..), empty, fromBytes, toBytes)
@@ -122,11 +124,20 @@ main = do
     Just p -> putStrLn $ "Connecting to port: " ++ show p
   putStrLn "WASD to move"
 
-  -- Initialize gbnet peer
+  -- Initialize gbnet peer with unreliable channel for position updates
   let bindAddr = SockAddrInet (fromIntegral localPort) 0
+      -- Channel 0: Unreliable for position updates (fire and forget)
+      unreliableChannel = defaultChannelConfig {ccDeliveryMode = Unreliable}
+      -- High send rate, no congestion window
+      config =
+        defaultNetworkConfig
+          { ncChannelConfigs = [unreliableChannel],
+            ncSendRate = 1000.0, -- Allow high send rate
+            ncMaxPacketRate = 1000.0
+          }
   now <- getMonoTime
 
-  result <- newPeer bindAddr defaultNetworkConfig now
+  result <- newPeer bindAddr config now
   case result of
     Left err -> error $ "Failed to create peer: " ++ show err
     Right peer -> do
@@ -156,26 +167,48 @@ main = do
         (update localStateRef netStateRef)
 
 -- | Network loop running in separate thread.
--- Uses the pure API: peerRecvAll -> peerProcess -> peerSendAll
+--
+-- Demonstrates pure/IO separation:
+--   1. Receive packets (IO)
+--   2. Queue outgoing messages (pure)
+--   3. Process packets and update state (pure)
+--   4. Send packets (IO)
 networkLoop :: NetPeer -> IORef PlayerState -> IORef NetState -> IO ()
-networkLoop initialPeer localStateRef netStateRef = go initialPeer Map.empty
+networkLoop initialPeer localStateRef netStateRef = go initialPeer Map.empty `catch` handleEx
   where
+    handleEx :: SomeException -> IO ()
+    handleEx e = putStrLn $ "NETWORK THREAD CRASHED: " ++ show e
+
     go peer peers = do
       now <- getMonoTime
       localState <- readIORef localStateRef
 
-      -- Queue state broadcast, receive, process, send
-      let withBroadcast = peerBroadcast stateChannel (encodeState localState) Nothing now peer
-      (packets, sockAfterRecv) <- peerRecvAll (npSocket withBroadcast) now
-      let PeerResult processed events outgoing = peerProcess now packets withBroadcast {npSocket = sockAfterRecv}
-      sockAfterSend <- peerSendAll outgoing (npSocket processed) now
+      -- 1. Receive packets (IO)
+      (packets, sock') <- peerRecvAll (npSocket peer) now
+
+      -- 2. Process packets first (establishes connections)
+      let result = peerProcess now packets peer {npSocket = sock'}
+          peer1 = prPeer result
+          events = prEvents result
+          outgoing1 = prOutgoing result
+
+      -- 3. Queue broadcast on UPDATED peer (now has connections)
+      let encoded = encodeState localState
+          peer2 = peerBroadcast stateChannel encoded Nothing now peer1
+
+      -- 4. Drain send queue to get broadcast packets
+      let (broadcastPackets, peer') = drainPeerSendQueue peer2
+          outgoing = outgoing1 ++ broadcastPackets
+
+      -- 5. Send all packets (IO)
+      sock'' <- peerSendAll outgoing (npSocket peer') now
 
       -- Update peer map and shared state
       peers' <- foldM handleEvent peers events
       writeIORef netStateRef $ NetState localState peers' (Map.size peers')
 
       threadDelay netTickUs
-      go processed {npSocket = sockAfterSend} peers'
+      go peer' {npSocket = sock''} peers'
 
     encodeState = toBytes . (`bitSerialize` empty)
 
@@ -186,7 +219,7 @@ networkLoop initialPeer localStateRef netStateRef = go initialPeer Map.empty
       PeerDisconnected pid reason -> do
         putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
         pure $ Map.delete pid peerMap
-      PeerMessage pid _ dat ->
+      PeerMessage pid _ch dat ->
         pure $ case bitDeserialize (fromBytes dat) of
           Left _ -> peerMap
           Right result -> Map.insert pid (readValue result) peerMap
