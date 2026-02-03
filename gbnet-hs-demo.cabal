@@ -21,5 +21,6 @@ executable gbnet-demo
     , containers
     , time
     , network
+    , mtl
   default-language: Haskell2010
   ghc-options:      -Wall -threaded
