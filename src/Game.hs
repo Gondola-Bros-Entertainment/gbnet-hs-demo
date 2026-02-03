@@ -1,3 +1,5 @@
+{-# LANGUAGE TemplateHaskell #-}
+
 -- |
 -- Module      : Game
 -- Description : Shared game state types for P2P demo
@@ -25,6 +27,7 @@ module Game
 where
 
 import Data.Word (Word16)
+import GBNet.Serialize.TH (deriveNetworkSerialize)
 
 -- | Tick rate in Hz.
 tickRateHz :: Int
@@ -82,14 +85,20 @@ data PlayerInput = PlayerInput
 -- | Apply player input to state.
 applyInput :: Float -> PlayerInput -> PlayerState -> PlayerState
 applyInput dt input ps =
-  let dx = (if piRight input then moveSpeed else 0)
-         - (if piLeft input then moveSpeed else 0)
-      dy = (if piDown input then moveSpeed else 0)
-         - (if piUp input then moveSpeed else 0)
+  let dx =
+        (if piRight input then moveSpeed else 0)
+          - (if piLeft input then moveSpeed else 0)
+      dy =
+        (if piDown input then moveSpeed else 0)
+          - (if piUp input then moveSpeed else 0)
       newX = clamp playerRadius (windowWidth - playerRadius) (psX ps + dx * dt)
       newY = clamp playerRadius (windowHeight - playerRadius) (psY ps + dy * dt)
-   in ps { psX = newX, psY = newY, psVelX = dx, psVelY = dy }
+   in ps {psX = newX, psY = newY, psVelX = dx, psVelY = dy}
 
 -- | Clamp a value to a range.
 clamp :: Float -> Float -> Float -> Float
 clamp lo hi x = max lo (min hi x)
+
+-- Generate BitSerialize instances
+deriveNetworkSerialize ''PlayerState
+deriveNetworkSerialize ''PlayerInput

@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- |
 -- Module      : Main
 -- Description : P2P demo for gbnet-hs with Gloss rendering
@@ -11,29 +13,52 @@
 --   gbnet-demo 7778 7777    -- Binds to 7778, connects to peer on 7777
 module Main where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Monad (foldM)
+import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word16)
+import Data.Maybe (fromMaybe)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word16, Word8)
+import GBNet.Config (defaultNetworkConfig)
+import GBNet.Peer
+import GBNet.Reliability (MonoTime)
+import GBNet.Serialize.BitBuffer (ReadResult (..), empty, fromBytes, toBytes)
+import GBNet.Serialize.Class (BitDeserialize (..), BitSerialize (..))
+import Game
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
+import Network.Socket (SockAddr (..), tupleToHostAddress)
 import System.Environment (getArgs)
 import Text.Read (readMaybe)
 
-import Game
+-- | Get current monotonic time in milliseconds.
+getMonoTime :: IO MonoTime
+getMonoTime = do
+  t <- getPOSIXTime
+  pure $ round (t * 1000)
 
 -- | Window dimensions (integer version for gloss).
 windowWidthInt, windowHeightInt :: Int
 windowWidthInt = round windowWidth
 windowHeightInt = round windowHeight
 
--- | Demo state.
+-- | Demo state (render side).
 data DemoState = DemoState
   { dsLocalState :: !PlayerState,
     dsLocalInput :: !PlayerInput,
-    dsPeers :: !(Map Word16 PlayerState),  -- port -> state
+    dsPeers :: !(Map PeerId PlayerState),
     dsLocalPort :: !Word16
   }
   deriving (Show)
+
+-- | Network state shared between threads.
+data NetState = NetState
+  { nsLocalState :: !PlayerState,
+    nsPeers :: !(Map PeerId PlayerState),
+    nsPeerCount :: !Int
+  }
 
 -- | Initial demo state.
 initialDemoState :: Word16 -> DemoState
@@ -48,14 +73,14 @@ initialDemoState port =
 -- | Colors for players (local is first).
 playerColors :: [Color]
 playerColors =
-  [ makeColorI 50 200 50 255,   -- Green (local player)
-    makeColorI 255 50 50 255,   -- Red
-    makeColorI 50 50 255 255,   -- Blue
-    makeColorI 255 255 50 255,  -- Yellow
-    makeColorI 255 50 255 255,  -- Magenta
-    makeColorI 50 255 255 255,  -- Cyan
-    makeColorI 255 128 50 255,  -- Orange
-    makeColorI 128 50 255 255   -- Purple
+  [ makeColorI 50 200 50 255, -- Green (local player)
+    makeColorI 255 50 50 255, -- Red
+    makeColorI 50 50 255 255, -- Blue
+    makeColorI 255 255 50 255, -- Yellow
+    makeColorI 255 50 255 255, -- Magenta
+    makeColorI 50 255 255 255, -- Cyan
+    makeColorI 255 128 50 255, -- Orange
+    makeColorI 128 50 255 255 -- Purple
   ]
 
 -- | Player render size (2x radius for full square).
@@ -77,63 +102,135 @@ hudTopOffset = centerY - 30
 hudLineSpacing :: Float
 hudLineSpacing = 20
 
+-- | Channel for state broadcasts.
+stateChannel :: Word8
+stateChannel = 0
+
+-- | Network tick rate in microseconds.
+netTickUs :: Int
+netTickUs = 16667 -- ~60Hz
+
 main :: IO ()
 main = do
   args <- getArgs
+  let (localPort, connectTo) = parseArgs args
 
-  let (localPort, _connectTo) = parseArgs args
-
-  putStrLn $ "gbnet-hs P2P demo"
+  putStrLn "gbnet-hs P2P demo"
   putStrLn $ "Binding to port: " ++ show localPort
+  case connectTo of
+    Nothing -> putStrLn "Waiting for connections..."
+    Just p -> putStrLn $ "Connecting to port: " ++ show p
   putStrLn "WASD to move"
-  putStrLn "[Placeholder: gbnet peer not yet integrated]"
 
-  -- TODO: Initialize gbnet peer
-  -- let addr = SockAddrInet (fromIntegral localPort) 0
-  -- result <- newPeer addr defaultNetworkConfig =<< getMonoTime
-  -- case result of
-  --   Left err -> error $ "Failed to create peer: " ++ show err
-  --   Right peer -> do
-  --     peer' <- case connectTo of
-  --       Nothing -> pure peer
-  --       Just targetPort -> do
-  --         let targetAddr = SockAddrInet (fromIntegral targetPort) (tupleToHostAddress (127,0,0,1))
-  --         peerConnect (peerIdFromAddr targetAddr) =<< getMonoTime $ peer
-  --     runDemo peer' localPort
+  -- Initialize gbnet peer
+  let bindAddr = SockAddrInet (fromIntegral localPort) 0
+  now <- getMonoTime
 
-  playIO
-    (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
-    (makeColorI 25 25 38 255)
-    60
-    (initialDemoState localPort)
-    render
-    handleInput
-    update
+  result <- newPeer bindAddr defaultNetworkConfig now
+  case result of
+    Left err -> error $ "Failed to create peer: " ++ show err
+    Right peer -> do
+      -- Connect to target if specified (peerConnect is pure)
+      let peer' = case connectTo of
+            Nothing -> peer
+            Just targetPort ->
+              let targetAddr = SockAddrInet (fromIntegral targetPort) (tupleToHostAddress (127, 0, 0, 1))
+                  targetPid = peerIdFromAddr targetAddr
+               in peerConnect targetPid now peer
+
+      -- Shared state between network thread and render thread
+      localStateRef <- newIORef defaultPlayerState
+      netStateRef <- newIORef (NetState defaultPlayerState Map.empty 0)
+
+      -- Start network thread
+      _ <- forkIO $ networkLoop peer' localStateRef netStateRef
+
+      -- Run gloss on main thread
+      playIO
+        (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
+        (makeColorI 25 25 38 255)
+        60
+        (initialDemoState localPort)
+        (render netStateRef)
+        handleInput
+        (update localStateRef netStateRef)
+
+-- | Network loop running in separate thread.
+-- Uses the pure API: peerRecvAll -> peerProcess -> peerSendAll
+networkLoop :: NetPeer -> IORef PlayerState -> IORef NetState -> IO ()
+networkLoop initialPeer localStateRef netStateRef = go initialPeer Map.empty
+  where
+    go peer peers = do
+      now <- getMonoTime
+      localState <- readIORef localStateRef
+
+      -- Queue state broadcast, receive, process, send
+      let withBroadcast = peerBroadcast stateChannel (encodeState localState) Nothing now peer
+      (packets, sockAfterRecv) <- peerRecvAll (npSocket withBroadcast) now
+      let PeerResult processed events outgoing = peerProcess now packets withBroadcast {npSocket = sockAfterRecv}
+      sockAfterSend <- peerSendAll outgoing (npSocket processed) now
+
+      -- Update peer map and shared state
+      peers' <- foldM handleEvent peers events
+      writeIORef netStateRef $ NetState localState peers' (Map.size peers')
+
+      threadDelay netTickUs
+      go processed {npSocket = sockAfterSend} peers'
+
+    encodeState = toBytes . (`bitSerialize` empty)
+
+    handleEvent peerMap = \case
+      PeerConnected pid dir -> do
+        putStrLn $ "Connected: " ++ show pid ++ " (" ++ show dir ++ ")"
+        pure $ Map.insert pid defaultPlayerState peerMap
+      PeerDisconnected pid reason -> do
+        putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
+        pure $ Map.delete pid peerMap
+      PeerMessage pid _ dat ->
+        pure $ case bitDeserialize (fromBytes dat) of
+          Left _ -> peerMap
+          Right result -> Map.insert pid (readValue result) peerMap
+      PeerMigrated oldPid newPid -> do
+        putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
+        pure $ maybe peerMap (\ps -> Map.insert newPid ps $ Map.delete oldPid peerMap) (Map.lookup oldPid peerMap)
 
 -- | Parse command line args: [localPort] [connectToPort]
 parseArgs :: [String] -> (Word16, Maybe Word16)
 parseArgs [] = (defaultPort, Nothing)
-parseArgs [p] = (maybe defaultPort id (readMaybe p), Nothing)
-parseArgs (p:t:_) = (maybe defaultPort id (readMaybe p), readMaybe t)
+parseArgs [p] = (fromMaybe defaultPort (readMaybe p), Nothing)
+parseArgs (p : t : _) = (fromMaybe defaultPort (readMaybe p), readMaybe t)
 
 -- | Render the demo.
-render :: DemoState -> IO Picture
-render state = pure $ Pictures $
-  -- Draw local player (green)
-  [ drawPlayer (head playerColors) (dsLocalState state) True
-  ] ++
-  -- Draw peer players
-  [ drawPlayer (playerColors !! (i `mod` length playerColors)) ps False
-  | (i, (_, ps)) <- zip [1..] (Map.toList (dsPeers state))
-  ] ++
-  -- Draw HUD
-  [ Translate hudLeftMargin hudTopOffset $ Scale 0.12 0.12 $ Color white $
-      Text $ "Port: " ++ show (dsLocalPort state)
-  , Translate hudLeftMargin (hudTopOffset - hudLineSpacing) $ Scale 0.10 0.10 $ Color (greyN 0.5) $
-      Text $ "Peers: " ++ show (Map.size (dsPeers state))
-  , Translate hudLeftMargin (hudTopOffset - hudLineSpacing * 2) $ Scale 0.10 0.10 $ Color (greyN 0.5) $
-      Text "WASD to move"
-  ]
+render :: IORef NetState -> DemoState -> IO Picture
+render netStateRef state = do
+  netState <- readIORef netStateRef
+  pure $
+    Pictures $
+      -- Draw local player (green)
+      [ drawPlayer (head playerColors) (dsLocalState state) True
+      ]
+        ++
+        -- Draw peer players
+        [ drawPlayer (playerColors !! (i `mod` length playerColors)) ps False
+        | (i, (_, ps)) <- zip [1 ..] (Map.toList (nsPeers netState))
+        ]
+        ++
+        -- Draw HUD
+        [ Translate hudLeftMargin hudTopOffset $
+            Scale 0.12 0.12 $
+              Color white $
+                Text $
+                  "Port: " ++ show (dsLocalPort state),
+          Translate hudLeftMargin (hudTopOffset - hudLineSpacing) $
+            Scale 0.10 0.10 $
+              Color (greyN 0.5) $
+                Text $
+                  "Peers: " ++ show (nsPeerCount netState),
+          Translate hudLeftMargin (hudTopOffset - hudLineSpacing * 2) $
+            Scale 0.10 0.10 $
+              Color (greyN 0.5) $
+                Text "WASD to move"
+        ]
 
 -- | Selection outline thickness.
 selectionOutlineThickness :: Float
@@ -144,11 +241,13 @@ drawPlayer :: Color -> PlayerState -> Bool -> Picture
 drawPlayer col ps isLocal =
   Translate (psX ps - centerX) (centerY - psY ps) $
     Pictures
-      [ Color col $ rectangleSolid playerRenderSize playerRenderSize
-      , if isLocal
-          then Color white $ rectangleWire
-                 (playerRenderSize + selectionOutlineThickness)
-                 (playerRenderSize + selectionOutlineThickness)
+      [ Color col $ rectangleSolid playerRenderSize playerRenderSize,
+        if isLocal
+          then
+            Color white $
+              rectangleWire
+                (playerRenderSize + selectionOutlineThickness)
+                (playerRenderSize + selectionOutlineThickness)
           else Blank
       ]
 
@@ -157,32 +256,24 @@ handleInput :: Event -> DemoState -> IO DemoState
 handleInput event state =
   let input = dsLocalInput state
       input' = case event of
-        EventKey (Char 'w') Down _ _ -> input { piUp = True }
-        EventKey (Char 'w') Up _ _   -> input { piUp = False }
-        EventKey (Char 's') Down _ _ -> input { piDown = True }
-        EventKey (Char 's') Up _ _   -> input { piDown = False }
-        EventKey (Char 'a') Down _ _ -> input { piLeft = True }
-        EventKey (Char 'a') Up _ _   -> input { piLeft = False }
-        EventKey (Char 'd') Down _ _ -> input { piRight = True }
-        EventKey (Char 'd') Up _ _   -> input { piRight = False }
+        EventKey (Char 'w') Down _ _ -> input {piUp = True}
+        EventKey (Char 'w') Up _ _ -> input {piUp = False}
+        EventKey (Char 's') Down _ _ -> input {piDown = True}
+        EventKey (Char 's') Up _ _ -> input {piDown = False}
+        EventKey (Char 'a') Down _ _ -> input {piLeft = True}
+        EventKey (Char 'a') Up _ _ -> input {piLeft = False}
+        EventKey (Char 'd') Down _ _ -> input {piRight = True}
+        EventKey (Char 'd') Up _ _ -> input {piRight = False}
         _ -> input
-   in pure state { dsLocalInput = input' }
+   in pure state {dsLocalInput = input'}
 
--- | Update the demo state.
-update :: Float -> DemoState -> IO DemoState
-update dt state = do
-  -- TODO: Network update
-  -- (events, peer') <- peerUpdate now peer
-  -- forM_ events $ \case
-  --   PeerConnected pid _ -> putStrLn $ "Peer connected: " ++ show pid
-  --   PeerDisconnected pid _ -> putStrLn $ "Peer disconnected: " ++ show pid
-  --   PeerMessage pid _ dat -> updatePeerState pid dat
-  --   _ -> pure ()
-  --
-  -- Broadcast local state
-  -- let encoded = serialize (dsLocalState state)
-  -- peerBroadcast 0 encoded Nothing now peer'
-
-  -- Local physics
+-- | Update the demo state (render thread).
+update :: IORef PlayerState -> IORef NetState -> Float -> DemoState -> IO DemoState
+update localStateRef _netStateRef dt state = do
+  -- Update local physics
   let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
-  pure state { dsLocalState = localState' }
+
+  -- Share with network thread
+  writeIORef localStateRef localState'
+
+  pure state {dsLocalState = localState'}
