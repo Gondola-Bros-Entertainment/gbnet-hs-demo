@@ -187,7 +187,7 @@ main = do
 -- | Network thread wrapper that handles exceptions.
 networkThread :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetState -> IORef Bool -> IO ()
 networkThread localStateRef sharedNetRef peerRef netState shutdownRef =
-  (evalNetT (networkLoop localStateRef sharedNetRef peerRef shutdownRef) netState) `catch` handleEx
+  evalNetT (networkLoop localStateRef sharedNetRef peerRef shutdownRef) netState `catch` handleEx
   where
     handleEx :: SomeException -> IO ()
     handleEx e = putStrLn $ "NETWORK THREAD CRASHED: " ++ show e
@@ -229,7 +229,7 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
           liftIO $ threadDelay netTickUs
           go peers'
 
-    handleEvents peerMap peer now evts = foldM (handleEvent now) (peerMap, peer) evts
+    handleEvents peerMap peer now = foldM (handleEvent now) (peerMap, peer)
 
     handleEvent now (peerMap, peer) = \case
       PeerConnected pid dir -> do
@@ -277,7 +277,7 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
         putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
         pure (maybe (peerMap, peer) (\ps -> (Map.insert newPid ps $ Map.delete oldPid peerMap, peer)) (Map.lookup oldPid peerMap))
 
-    -- | Deserialize a list of PeerAddr from mesh introduction message.
+    -- \| Deserialize a list of PeerAddr from mesh introduction message.
     deserializePeerAddrs :: BitReader [PeerAddr]
     deserializePeerAddrs = do
       count <- deserializeM :: BitReader Word16
