@@ -22,23 +22,27 @@ WASD to move. Each peer broadcasts its position over the network.
 
 ## Architecture
 
-Demonstrates the pure/IO separation in gbnet-hs:
+Demonstrates the polymorphic `peerTick` API in gbnet-hs:
 
 ```haskell
-go peer peers = do
-  -- 1. Queue outgoing messages (pure)
-  let withBroadcast = peerBroadcast channel state Nothing now peer
+networkLoop :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetT IO ()
+networkLoop localStateRef sharedNetRef peerRef = go Map.empty
+  where
+    go peers = do
+      peer <- liftIO $ readIORef peerRef
+      localState <- liftIO $ readIORef localStateRef
 
-  -- 2. Receive packets (IO)
-  (packets, sock') <- peerRecvAll (npSocket withBroadcast) now
+      -- Encode local state to broadcast
+      let encoded = toBytes (bitSerialize localState empty)
 
-  -- 3. Process packets (pure)
-  let PeerResult processed events outgoing = peerProcess now packets withBroadcast { npSocket = sock' }
+      -- Single call: receive, process, broadcast, send
+      (events, peer') <- peerTick [(stateChannel, encoded)] peer
 
-  -- 4. Send packets (IO)
-  sock'' <- peerSendAll outgoing (npSocket processed) now
-
-  go processed { npSocket = sock'' } peers'
+      -- Handle events and update peer map
+      peers' <- liftIO $ handleEvents peers events
+      liftIO $ threadDelay netTickUs
+      go peers'
 ```
 
-The networking logic is deterministic and testable - only socket operations are IO.
+The `peerTick` function handles receive, process, broadcast, and send in one call
+within the `NetT` monad, which abstracts over real sockets or pure test networks.

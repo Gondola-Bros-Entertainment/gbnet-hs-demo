@@ -29,6 +29,7 @@ import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
 import Network.Socket (SockAddr (..), tupleToHostAddress)
 import System.Environment (getArgs)
+import System.Exit (exitFailure)
 import Text.Read (readMaybe)
 
 -- | Window dimensions (integer version for gloss).
@@ -59,11 +60,14 @@ initialDemoState port =
       dsLocalPort = port
     }
 
--- | Colors for players (local is first).
-playerColors :: [Color]
-playerColors =
-  [ makeColorI 50 200 50 255, -- Green (local player)
-    makeColorI 255 50 50 255, -- Red
+-- | Color for the local player.
+localPlayerColor :: Color
+localPlayerColor = makeColorI 50 200 50 255
+
+-- | Colors for remote peers (cycles for >7 peers).
+remotePlayerColors :: [Color]
+remotePlayerColors =
+  [ makeColorI 255 50 50 255, -- Red
     makeColorI 50 50 255 255, -- Blue
     makeColorI 255 255 50 255, -- Yellow
     makeColorI 255 50 255 255, -- Magenta
@@ -130,10 +134,12 @@ main = do
   now <- getMonoTimeIO
   peerResult <- newPeer bindAddr config now
   case peerResult of
-    Left err -> error $ "Failed to create peer: " ++ show err
+    Left err -> do
+      putStrLn $ "Failed to create peer: " ++ show err
+      exitFailure
     Right (peer, sock) -> do
-      -- Create NetState from the peer's socket
-      let netState = newNetState sock (npLocalAddr peer)
+      -- Create NetState from the peer's socket (spawns receive thread)
+      netState <- newNetState sock (npLocalAddr peer)
 
       -- Connect to target if specified
       let peer' = case connectTo of
@@ -207,9 +213,11 @@ networkLoop localStateRef sharedNetRef peerRef = go Map.empty
         putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
         pure $ Map.delete pid peerMap
       PeerMessage pid _ch dat ->
-        pure $ case bitDeserialize (fromBytes dat) of
-          Left _ -> peerMap
-          Right (ReadResult ps _) -> Map.insert pid ps peerMap
+        case bitDeserialize (fromBytes dat) of
+          Left err -> do
+            putStrLn $ "Deserialize error from " ++ show pid ++ ": " ++ err
+            pure peerMap
+          Right (ReadResult ps _) -> pure $ Map.insert pid ps peerMap
       PeerMigrated oldPid newPid -> do
         putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
         pure $ maybe peerMap (\ps -> Map.insert newPid ps $ Map.delete oldPid peerMap) (Map.lookup oldPid peerMap)
@@ -227,12 +235,12 @@ render sharedNetRef state = do
   pure $
     Pictures $
       -- Draw local player (green)
-      [ drawPlayer (head playerColors) (dsLocalState state) True
+      [ drawPlayer localPlayerColor (dsLocalState state) True
       ]
         ++
         -- Draw peer players
-        [ drawPlayer (playerColors !! (i `mod` length playerColors)) ps False
-        | (i, (_, ps)) <- zip [1 ..] (Map.toList (snsPeers netState))
+        [ drawPlayer col ps False
+        | (col, (_, ps)) <- zip (cycle remotePlayerColors) (Map.toList (snsPeers netState))
         ]
         ++
         -- Draw HUD
