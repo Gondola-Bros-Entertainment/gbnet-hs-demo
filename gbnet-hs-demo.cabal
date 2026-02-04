@@ -1,25 +1,45 @@
 cabal-version:      3.0
 name:               gbnet-hs-demo
 version:            0.1.0.0
-synopsis:           Visual demo for gbnet-hs networking library
-license:            MIT
-author:             Devon Tomlin
-build-type:         Simple
+synopsis:           Visual P2P demo for the gbnet-hs networking library
+description:
+  A Gloss-rendered multiplayer demo showcasing gbnet-hs peer networking.
+  Run multiple instances on different ports to see automatic connection,
+  mesh peer introduction, and real-time position broadcast.
 
--- Single P2P demo executable
--- Run multiple instances to see them connect
+license:            MIT
+license-file:       LICENSE
+author:             Devon Tomlin
+maintainer:         devon@novavero.ai
+homepage:           https://github.com/Gondola-Bros-Entertainment/gbnet-hs-demo
+bug-reports:        https://github.com/Gondola-Bros-Entertainment/gbnet-hs-demo/issues
+category:           Network, Game, Demo
+stability:          experimental
+build-type:         Simple
+tested-with:        GHC == 9.6.7
+extra-doc-files:    README.md
+
 executable gbnet-demo
   main-is:          Main.hs
   other-modules:    Game
   hs-source-dirs:   src
   build-depends:
-      base >= 4.16 && < 5
+      base          >= 4.16 && < 5
     , gbnet-hs
-    , bytestring
-    , text
-    , gloss
-    , containers
-    , network
-    , mtl
+    , bytestring    >= 0.11 && < 0.13
+    , gloss         >= 1.13 && < 1.15
+    , containers    >= 0.6  && < 0.8
+    , network       >= 3.1  && < 3.3
+    , mtl           >= 2.2  && < 2.4
   default-language: Haskell2010
-  ghc-options:      -Wall -threaded
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -threaded
+
+source-repository head
+  type:     git
+  location: https://github.com/Gondola-Bros-Entertainment/gbnet-hs-demo
+  branch:   main
