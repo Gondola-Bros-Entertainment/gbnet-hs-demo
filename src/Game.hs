@@ -23,11 +23,18 @@ module Game
     -- * Movement
     applyInput,
     clamp,
+
+    -- * Mesh peer address (serializable)
+    PeerAddr (..),
+    peerIdToPeerAddr,
+    peerAddrToSockAddr,
   )
 where
 
-import Data.Word (Word16)
+import Data.Word (Word16, Word32)
+import GBNet.Peer (PeerId (..), unPeerId)
 import GBNet.Serialize.TH (deriveNetworkSerialize)
+import Network.Socket (SockAddr (..))
 
 -- | Tick rate in Hz.
 tickRateHz :: Int
@@ -99,6 +106,32 @@ applyInput dt input ps =
 clamp :: Float -> Float -> Float -> Float
 clamp lo hi x = max lo (min hi x)
 
+-- | Serializable peer address for mesh introduction.
+data PeerAddr = PeerAddr
+  { paHost :: !Word32,
+    paPort :: !Word16
+  }
+  deriving (Eq, Show)
+
+-- | Extract a serializable 'PeerAddr' from a 'PeerId'.
+-- Returns 'Nothing' for non-IPv4 addresses.
+peerIdToPeerAddr :: PeerId -> Maybe PeerAddr
+peerIdToPeerAddr pid =
+  case unPeerId pid of
+    SockAddrInet port host ->
+      Just
+        PeerAddr
+          { paHost = host,
+            paPort = fromIntegral port
+          }
+    _ -> Nothing
+
+-- | Convert a 'PeerAddr' back to a 'SockAddr'.
+peerAddrToSockAddr :: PeerAddr -> SockAddr
+peerAddrToSockAddr pa =
+  SockAddrInet (fromIntegral (paPort pa)) (paHost pa)
+
 -- Generate BitSerialize instances
 deriveNetworkSerialize ''PlayerState
 deriveNetworkSerialize ''PlayerInput
+deriveNetworkSerialize ''PeerAddr

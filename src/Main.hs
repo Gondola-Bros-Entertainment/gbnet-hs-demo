@@ -15,15 +15,17 @@ module Main where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, catch)
-import Control.Monad (foldM)
+import Control.Monad (foldM, replicateM)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef
+import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Word (Word16, Word8)
 import GBNet
-import GBNet.Serialize.BitBuffer (ReadResult (..))
+import GBNet.Serialize.BitBuffer (BitReader, ReadResult (..), runBitReader)
+import GBNet.Serialize.Class (deserializeM)
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
@@ -98,6 +100,10 @@ hudLineSpacing = 20
 stateChannel :: Word8
 stateChannel = 0
 
+-- | Channel for mesh peer introduction (reliable).
+meshChannel :: Word8
+meshChannel = 1
+
 -- | Network tick rate in microseconds.
 netTickUs :: Int
 netTickUs = 16667 -- ~60Hz
@@ -121,10 +127,12 @@ main = do
   -- Initialize network state
   let bindAddr = anyAddr localPort
       -- Channel 0: Unreliable for position updates (fire and forget)
+      -- Channel 1: Reliable for mesh peer introduction
       unreliableChannel = defaultChannelConfig {ccDeliveryMode = Unreliable}
+      reliableChannel = defaultChannelConfig {ccDeliveryMode = ReliableOrdered}
       config =
         defaultNetworkConfig
-          { ncChannelConfigs = [unreliableChannel],
+          { ncChannelConfigs = [unreliableChannel, reliableChannel],
             ncSendRate = 1000.0,
             ncMaxPacketRate = 1000.0
           }
@@ -183,6 +191,7 @@ networkLoop localStateRef sharedNetRef peerRef = go Map.empty
     go peers = do
       peer <- liftIO $ readIORef peerRef
       localState <- liftIO $ readIORef localStateRef
+      now <- liftIO getMonoTimeIO
 
       -- Encode local state to broadcast
       let encoded = toBytes (bitSerialize localState empty)
@@ -190,11 +199,11 @@ networkLoop localStateRef sharedNetRef peerRef = go Map.empty
       -- Single call: receive, process, broadcast, send
       (events, peer') <- peerTick [(stateChannel, encoded)] peer
 
-      -- Update peer ref
-      liftIO $ writeIORef peerRef peer'
+      -- Handle events, updating both peer map and peer state (for mesh sends)
+      (peers', peer'') <- liftIO $ handleEvents peers peer' now events
 
-      -- Handle events and update peer map
-      peers' <- liftIO $ handleEvents peers events
+      -- Update peer ref
+      liftIO $ writeIORef peerRef peer''
 
       -- Update shared state for render thread
       liftIO $ writeIORef sharedNetRef $ SharedNetState peers' (Map.size peers')
@@ -202,24 +211,59 @@ networkLoop localStateRef sharedNetRef peerRef = go Map.empty
       liftIO $ threadDelay netTickUs
       go peers'
 
-    handleEvents peerMap evts = foldM handleEvent peerMap evts
+    handleEvents peerMap peer now evts = foldM (handleEvent now) (peerMap, peer) evts
 
-    handleEvent peerMap = \case
+    handleEvent now (peerMap, peer) = \case
       PeerConnected pid dir -> do
         putStrLn $ "Connected: " ++ show pid ++ " (" ++ show dir ++ ")"
-        pure $ Map.insert pid defaultPlayerState peerMap
+        -- Send existing peer list to the new peer for mesh introduction
+        let existingPeers = filter (/= pid) (peerConnectedIds peer)
+            peerAddrs = mapMaybe peerIdToPeerAddr existingPeers
+            encoded = toBytes $ foldl' (flip bitSerialize) (bitSerialize (fromIntegral (length peerAddrs) :: Word16) empty) peerAddrs
+            peer' = case peerSend pid meshChannel encoded now peer of
+              Left _ -> peer
+              Right p -> p
+        pure (Map.insert pid defaultPlayerState peerMap, peer')
       PeerDisconnected pid reason -> do
         putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
-        pure $ Map.delete pid peerMap
+        pure (Map.delete pid peerMap, peer)
+      PeerMessage pid ch dat
+        | ch == meshChannel ->
+            -- Mesh peer introduction: deserialize peer addresses and connect
+            case runBitReader deserializePeerAddrs (fromBytes dat) of
+              Left err -> do
+                putStrLn $ "Mesh deserialize error from " ++ show pid ++ ": " ++ err
+                pure (peerMap, peer)
+              Right (addrs, _) -> do
+                let known = peerConnectedIds peer
+                    localAddr = npLocalAddr peer
+                    newPeers =
+                      [ peerIdFromAddr sa
+                      | addr <- addrs,
+                        let sa = peerAddrToSockAddr addr,
+                        peerIdFromAddr sa `notElem` known,
+                        sa /= localAddr
+                      ]
+                    peer' = foldl' (\p newPid -> peerConnect newPid now p) peer newPeers
+                if null newPeers
+                  then pure ()
+                  else putStrLn $ "Mesh: connecting to " ++ show (length newPeers) ++ " new peer(s)"
+                pure (peerMap, peer')
       PeerMessage pid _ch dat ->
         case bitDeserialize (fromBytes dat) of
           Left err -> do
             putStrLn $ "Deserialize error from " ++ show pid ++ ": " ++ err
-            pure peerMap
-          Right (ReadResult ps _) -> pure $ Map.insert pid ps peerMap
+            pure (peerMap, peer)
+          Right (ReadResult ps _) -> pure (Map.insert pid ps peerMap, peer)
       PeerMigrated oldPid newPid -> do
         putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
-        pure $ maybe peerMap (\ps -> Map.insert newPid ps $ Map.delete oldPid peerMap) (Map.lookup oldPid peerMap)
+        pure (maybe (peerMap, peer) (\ps -> (Map.insert newPid ps $ Map.delete oldPid peerMap, peer)) (Map.lookup oldPid peerMap))
+
+    -- | Deserialize a list of PeerAddr from mesh introduction message.
+    deserializePeerAddrs :: BitReader [PeerAddr]
+    deserializePeerAddrs = do
+      count <- deserializeM :: BitReader Word16
+      replicateM (fromIntegral count) deserializeM
 
 -- | Parse command line args: [localPort] [connectToPort]
 parseArgs :: [String] -> (Word16, Maybe Word16)
