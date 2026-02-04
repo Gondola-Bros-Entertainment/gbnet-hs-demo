@@ -27,7 +27,7 @@ import GBNet.Serialize.BitBuffer (ReadResult (..))
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
-import Network.Socket (SockAddr (..), tupleToHostAddress)
+import Network.Socket (tupleToHostAddress)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import Text.Read (readMaybe)
