@@ -27,7 +27,6 @@ import GBNet.Serialize.BitBuffer (ReadResult (..))
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
-import Network.Socket (tupleToHostAddress)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import Text.Read (readMaybe)
@@ -120,7 +119,7 @@ main = do
   putStrLn "WASD to move"
 
   -- Initialize network state
-  let bindAddr = SockAddrInet (fromIntegral localPort) 0
+  let bindAddr = anyAddr localPort
       -- Channel 0: Unreliable for position updates (fire and forget)
       unreliableChannel = defaultChannelConfig {ccDeliveryMode = Unreliable}
       config =
@@ -145,7 +144,7 @@ main = do
       let peer' = case connectTo of
             Nothing -> peer
             Just targetPort ->
-              let targetAddr = SockAddrInet (fromIntegral targetPort) (tupleToHostAddress (127, 0, 0, 1))
+              let targetAddr = localhost targetPort
                   targetPid = peerIdFromAddr targetAddr
                in peerConnect targetPid now peer
 
