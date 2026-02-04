@@ -14,7 +14,7 @@
 module Main where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, finally)
 import Control.Monad (foldM, replicateM)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef
@@ -22,8 +22,9 @@ import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Word (Word16, Word8)
+import Data.Word (Word16)
 import GBNet
+import GBNet.Peer (npLocalAddr)
 import GBNet.Serialize.BitBuffer (BitReader, ReadResult (..), runBitReader)
 import GBNet.Serialize.Class (deserializeM)
 import Game hiding (defaultPort)
@@ -97,16 +98,20 @@ hudLineSpacing :: Float
 hudLineSpacing = 20
 
 -- | Channel for state broadcasts.
-stateChannel :: Word8
-stateChannel = 0
+stateChannel :: ChannelId
+stateChannel = ChannelId 0
 
 -- | Channel for mesh peer introduction (reliable).
-meshChannel :: Word8
-meshChannel = 1
+meshChannel :: ChannelId
+meshChannel = ChannelId 1
 
 -- | Network tick rate in microseconds.
 netTickUs :: Int
 netTickUs = 16667 -- ~60Hz
+
+-- | Shutdown grace period in microseconds (lets disconnect packets send).
+shutdownDelayUs :: Int
+shutdownDelayUs = 100000 -- 100ms
 
 -- | Default port.
 defaultPort :: Word16
@@ -160,11 +165,12 @@ main = do
       localStateRef <- newIORef defaultPlayerState
       sharedNetRef <- newIORef (SharedNetState Map.empty 0)
       peerRef <- newIORef peer'
+      shutdownRef <- newIORef False
 
-      -- Start network thread with new polymorphic API
-      _ <- forkIO $ networkThread localStateRef sharedNetRef peerRef netState
+      -- Start network thread
+      _ <- forkIO $ networkThread localStateRef sharedNetRef peerRef netState shutdownRef
 
-      -- Run gloss on main thread
+      -- Run gloss on main thread; signal shutdown when window closes
       playIO
         (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
         (makeColorI 25 25 38 255)
@@ -173,11 +179,15 @@ main = do
         (render sharedNetRef)
         handleInput
         (update localStateRef sharedNetRef)
+        `finally` do
+          writeIORef shutdownRef True
+          threadDelay shutdownDelayUs
+          putStrLn "Shutdown complete."
 
 -- | Network thread wrapper that handles exceptions.
-networkThread :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetState -> IO ()
-networkThread localStateRef sharedNetRef peerRef netState =
-  (evalNetT (networkLoop localStateRef sharedNetRef peerRef) netState) `catch` handleEx
+networkThread :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetState -> IORef Bool -> IO ()
+networkThread localStateRef sharedNetRef peerRef netState shutdownRef =
+  (evalNetT (networkLoop localStateRef sharedNetRef peerRef shutdownRef) netState) `catch` handleEx
   where
     handleEx :: SomeException -> IO ()
     handleEx e = putStrLn $ "NETWORK THREAD CRASHED: " ++ show e
@@ -185,31 +195,39 @@ networkThread localStateRef sharedNetRef peerRef netState =
 -- | Network loop using the new polymorphic API.
 --
 -- Runs inside NetT IO, using peerTick for clean receive/process/send.
-networkLoop :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetT IO ()
-networkLoop localStateRef sharedNetRef peerRef = go Map.empty
+-- Checks the shutdown ref each tick and sends disconnect packets before exiting.
+networkLoop :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> IORef Bool -> NetT IO ()
+networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
   where
     go peers = do
-      peer <- liftIO $ readIORef peerRef
-      localState <- liftIO $ readIORef localStateRef
-      now <- liftIO getMonoTimeIO
+      shutdown <- liftIO $ readIORef shutdownRef
+      if shutdown
+        then do
+          peer <- liftIO $ readIORef peerRef
+          peerShutdownM peer
+          liftIO $ putStrLn "Network shutdown: disconnect packets sent."
+        else do
+          peer <- liftIO $ readIORef peerRef
+          localState <- liftIO $ readIORef localStateRef
+          now <- liftIO getMonoTimeIO
 
-      -- Encode local state to broadcast
-      let encoded = toBytes (bitSerialize localState empty)
+          -- Encode local state to broadcast
+          let encoded = toBytes (bitSerialize localState empty)
 
-      -- Single call: receive, process, broadcast, send
-      (events, peer') <- peerTick [(stateChannel, encoded)] peer
+          -- Single call: receive, process, broadcast, send
+          (events, peer') <- peerTick [(stateChannel, encoded)] peer
 
-      -- Handle events, updating both peer map and peer state (for mesh sends)
-      (peers', peer'') <- liftIO $ handleEvents peers peer' now events
+          -- Handle events, updating both peer map and peer state (for mesh sends)
+          (peers', peer'') <- liftIO $ handleEvents peers peer' now events
 
-      -- Update peer ref
-      liftIO $ writeIORef peerRef peer''
+          -- Update peer ref
+          liftIO $ writeIORef peerRef peer''
 
-      -- Update shared state for render thread
-      liftIO $ writeIORef sharedNetRef $ SharedNetState peers' (Map.size peers')
+          -- Update shared state for render thread
+          liftIO $ writeIORef sharedNetRef $ SharedNetState peers' (Map.size peers')
 
-      liftIO $ threadDelay netTickUs
-      go peers'
+          liftIO $ threadDelay netTickUs
+          go peers'
 
     handleEvents peerMap peer now evts = foldM (handleEvent now) (peerMap, peer) evts
 
