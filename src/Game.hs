@@ -32,8 +32,9 @@ module Game
 where
 
 import Data.Word (Word16, Word32)
+import Foreign.Ptr (plusPtr)
 import GBNet.Peer (PeerId (..), unPeerId)
-import GBNet.Serialize.TH (deriveNetworkSerialize)
+import GBNet.Serialize.FastTH (deriveStorable)
 import Network.Socket (SockAddr (..))
 
 -- | Tick rate in Hz.
@@ -131,7 +132,7 @@ peerAddrToSockAddr :: PeerAddr -> SockAddr
 peerAddrToSockAddr pa =
   SockAddrInet (fromIntegral (paPort pa)) (paHost pa)
 
--- Generate BitSerialize instances
-deriveNetworkSerialize ''PlayerState
-deriveNetworkSerialize ''PlayerInput
-deriveNetworkSerialize ''PeerAddr
+-- Generate Storable instances for zero-copy serialization
+deriveStorable ''PlayerState
+deriveStorable ''PlayerInput
+deriveStorable ''PeerAddr

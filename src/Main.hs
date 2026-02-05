@@ -23,10 +23,10 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Word (Word16)
+import qualified Data.ByteString as BS
 import GBNet
 import GBNet.Peer (npLocalAddr)
-import GBNet.Serialize.BitBuffer (BitReader, ReadResult (..), runBitReader)
-import GBNet.Serialize.Class (deserializeM)
+import GBNet.Serialize.FastSupport (Storable (..), deserialize, serialize)
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
@@ -212,7 +212,7 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
           now <- liftIO getMonoTimeIO
 
           -- Encode local state to broadcast
-          let encoded = toBytes (bitSerialize localState empty)
+          let encoded = serialize localState
 
           -- Single call: receive, process, broadcast, send
           (events, peer') <- peerTick [(stateChannel, encoded)] peer
@@ -237,7 +237,7 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
         -- Send existing peer list to the new peer for mesh introduction
         let existingPeers = filter (/= pid) (peerConnectedIds peer)
             peerAddrs = mapMaybe peerIdToPeerAddr existingPeers
-            encoded = toBytes $ foldl' (flip bitSerialize) (bitSerialize (fromIntegral (length peerAddrs) :: Word16) empty) peerAddrs
+            encoded = encodePeerAddrs peerAddrs
             peer' = case peerSend pid meshChannel encoded now peer of
               Left _ -> peer
               Right p -> p
@@ -248,11 +248,11 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
       PeerMessage pid ch dat
         | ch == meshChannel ->
             -- Mesh peer introduction: deserialize peer addresses and connect
-            case runBitReader deserializePeerAddrs (fromBytes dat) of
+            case decodePeerAddrs dat of
               Left err -> do
                 putStrLn $ "Mesh deserialize error from " ++ show pid ++ ": " ++ err
                 pure (peerMap, peer)
-              Right (addrs, _) -> do
+              Right addrs -> do
                 let known = peerConnectedIds peer
                     localAddr = npLocalAddr peer
                     newPeers =
@@ -268,20 +268,38 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
                   else putStrLn $ "Mesh: connecting to " ++ show (length newPeers) ++ " new peer(s)"
                 pure (peerMap, peer')
       PeerMessage pid _ch dat ->
-        case bitDeserialize (fromBytes dat) of
+        case deserialize dat of
           Left err -> do
             putStrLn $ "Deserialize error from " ++ show pid ++ ": " ++ err
             pure (peerMap, peer)
-          Right (ReadResult ps _) -> pure (Map.insert pid ps peerMap, peer)
+          Right ps -> pure (Map.insert pid ps peerMap, peer)
       PeerMigrated oldPid newPid -> do
         putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
         pure (maybe (peerMap, peer) (\ps -> (Map.insert newPid ps $ Map.delete oldPid peerMap, peer)) (Map.lookup oldPid peerMap))
 
-    -- \| Deserialize a list of PeerAddr from mesh introduction message.
-    deserializePeerAddrs :: BitReader [PeerAddr]
-    deserializePeerAddrs = do
-      count <- deserializeM :: BitReader Word16
-      replicateM (fromIntegral count) deserializeM
+-- | Encode a list of PeerAddr for mesh introduction.
+encodePeerAddrs :: [PeerAddr] -> BS.ByteString
+encodePeerAddrs addrs =
+  let count = fromIntegral (length addrs) :: Word16
+   in serialize count <> mconcat (map serialize addrs)
+
+-- | Decode a list of PeerAddr from mesh introduction message.
+decodePeerAddrs :: BS.ByteString -> Either String [PeerAddr]
+decodePeerAddrs bs
+  | BS.length bs < 2 = Left "buffer too short for count"
+  | otherwise = do
+      let countBs = BS.take 2 bs
+          addrsBs = BS.drop 2 bs
+      count <- deserialize countBs :: Either String Word16
+      decodeN (fromIntegral count) addrsBs []
+  where
+    addrSize = sizeOf (undefined :: PeerAddr)
+    decodeN 0 _ acc = Right (reverse acc)
+    decodeN n remaining acc
+      | BS.length remaining < addrSize = Left "buffer too short for PeerAddr"
+      | otherwise = do
+          addr <- deserialize (BS.take addrSize remaining)
+          decodeN (n - 1) (BS.drop addrSize remaining) (addr : acc)
 
 -- | Parse command line args: [localPort] [connectToPort]
 parseArgs :: [String] -> (Word16, Maybe Word16)
