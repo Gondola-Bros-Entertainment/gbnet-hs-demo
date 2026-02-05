@@ -15,7 +15,7 @@ module Main where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, catch, finally)
-import Control.Monad (foldM, replicateM)
+import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef
 import Data.List (foldl')
@@ -26,7 +26,6 @@ import Data.Word (Word16)
 import qualified Data.ByteString as BS
 import GBNet
 import GBNet.Peer (npLocalAddr)
-import GBNet.Serialize.FastSupport (Storable (..), deserialize, serialize)
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
@@ -291,7 +290,7 @@ decodePeerAddrs bs
       let countBs = BS.take 2 bs
           addrsBs = BS.drop 2 bs
       count <- deserialize countBs :: Either String Word16
-      decodeN (fromIntegral count) addrsBs []
+      decodeN (fromIntegral count :: Int) addrsBs []
   where
     addrSize = sizeOf (undefined :: PeerAddr)
     decodeN 0 _ acc = Right (reverse acc)
