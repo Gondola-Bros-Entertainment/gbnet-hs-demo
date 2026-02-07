@@ -4,8 +4,8 @@
 -- Module      : Main
 -- Description : P2P demo for gbnet-hs with Gloss rendering
 --
--- Run multiple instances of this demo to see them connect.
--- Each instance is a peer that broadcasts its position.
+-- Single-threaded architecture: networking runs inside Gloss's update
+-- callback via 'runNetT'. Pure event processing via 'processEvents'.
 --
 -- Usage:
 --   gbnet-demo              -- Binds to port 7777
@@ -13,10 +13,8 @@
 --   gbnet-demo 7778 7777    -- Binds to 7778, connects to peer on 7777
 module Main where
 
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (SomeException, catch, finally)
-import Control.Monad (foldM)
-import Control.Monad.IO.Class (liftIO)
+import Control.Concurrent (threadDelay)
+import Control.Exception (finally)
 import Data.IORef
 import Data.List (foldl')
 import Data.Map.Strict (Map)
@@ -38,27 +36,26 @@ windowWidthInt, windowHeightInt :: Int
 windowWidthInt = round windowWidth
 windowHeightInt = round windowHeight
 
--- | Demo state (render side).
+-- | Demo state (unified, single-threaded).
 data DemoState = DemoState
   { dsLocalState :: !PlayerState,
     dsLocalInput :: !PlayerInput,
-    dsLocalPort :: !Word16
-  }
-  deriving (Show)
-
--- | Network state shared between threads.
-data SharedNetState = SharedNetState
-  { snsPeers :: !(Map PeerId PlayerState),
-    snsPeerCount :: !Int
+    dsLocalPort :: !Word16,
+    dsPeer :: !NetPeer,
+    dsNet :: !NetState,
+    dsPeers :: !(Map PeerId PlayerState)
   }
 
 -- | Initial demo state.
-initialDemoState :: Word16 -> DemoState
-initialDemoState port =
+initialDemoState :: Word16 -> NetPeer -> NetState -> DemoState
+initialDemoState port peer netSt =
   DemoState
     { dsLocalState = defaultPlayerState,
       dsLocalInput = PlayerInput False False False False,
-      dsLocalPort = port
+      dsLocalPort = port,
+      dsPeer = peer,
+      dsNet = netSt,
+      dsPeers = Map.empty
     }
 
 -- | Color for the local player.
@@ -104,10 +101,6 @@ stateChannel = ChannelId 0
 meshChannel :: ChannelId
 meshChannel = ChannelId 1
 
--- | Network tick rate in microseconds.
-netTickUs :: Int
-netTickUs = 16667 -- ~60Hz
-
 -- | Shutdown grace period in microseconds (lets disconnect packets send).
 shutdownDelayUs :: Int
 shutdownDelayUs = 100000 -- 100ms
@@ -128,7 +121,6 @@ main = do
     Just p -> putStrLn $ "Connecting to port: " ++ show p
   putStrLn "WASD to move"
 
-  -- Initialize network state
   let bindAddr = anyAddr localPort
       -- Channel 0: Unreliable for position updates (fire and forget)
       -- Channel 1: Reliable for mesh peer introduction
@@ -139,7 +131,6 @@ main = do
             ncMaxPacketRate = 1000.0
           }
 
-  -- Create peer (newPeer creates the socket)
   now <- getMonoTimeIO
   peerResult <- newPeer bindAddr config now
   case peerResult of
@@ -147,10 +138,8 @@ main = do
       putStrLn $ "Failed to create peer: " ++ show err
       exitFailure
     Right (peer, sock) -> do
-      -- Create NetState from the peer's socket (spawns receive thread)
-      netState <- newNetState sock (peerLocalAddr peer)
+      netSt <- newNetState sock (peerLocalAddr peer)
 
-      -- Connect to target if specified
       let peer' = case connectTo of
             Nothing -> peer
             Just targetPort ->
@@ -158,156 +147,124 @@ main = do
                   targetPid = peerIdFromAddr targetAddr
                in peerConnect targetPid now peer
 
-      -- Shared state between network thread and render thread
-      localStateRef <- newIORef defaultPlayerState
-      sharedNetRef <- newIORef (SharedNetState Map.empty 0)
-      peerRef <- newIORef peer'
-      shutdownRef <- newIORef False
+      -- Single IORef for shutdown cleanup (playIO doesn't return final state)
+      shutdownRef <- newIORef (peer', netSt)
 
-      -- Start network thread
-      _ <- forkIO $ networkThread localStateRef sharedNetRef peerRef netState shutdownRef
-
-      -- Run gloss on main thread; signal shutdown when window closes
       playIO
         (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
         (makeColorI 25 25 38 255)
-        60
-        (initialDemoState localPort)
-        (render sharedNetRef)
+        tickRateHz
+        (initialDemoState localPort peer' netSt)
+        render
         handleInput
-        (update localStateRef sharedNetRef)
-        `finally` do
-          writeIORef shutdownRef True
-          threadDelay shutdownDelayUs
-          putStrLn "Shutdown complete."
+        (update shutdownRef)
+        `finally` shutdown shutdownRef
 
--- | Network thread wrapper that handles exceptions.
-networkThread :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> NetState -> IORef Bool -> IO ()
-networkThread localStateRef sharedNetRef peerRef netState shutdownRef =
-  evalNetT (networkLoop localStateRef sharedNetRef peerRef shutdownRef) netState `catch` handleEx
-  where
-    handleEx :: SomeException -> IO ()
-    handleEx e = putStrLn $ "NETWORK THREAD CRASHED: " ++ show e
+-- | Update: physics, network tick, pure event processing, logging.
+update :: IORef (NetPeer, NetState) -> Float -> DemoState -> IO DemoState
+update shutdownRef dt state = do
+  -- Apply local physics
+  let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
+      encoded = serialize localState'
 
--- | Network loop using the new polymorphic API.
---
--- Runs inside NetT IO, using peerTick for clean receive/process/send.
--- Checks the shutdown ref each tick and sends disconnect packets before exiting.
-networkLoop :: IORef PlayerState -> IORef SharedNetState -> IORef NetPeer -> IORef Bool -> NetT IO ()
-networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
-  where
-    go peers = do
-      shutdown <- liftIO $ readIORef shutdownRef
-      if shutdown
-        then do
-          peer <- liftIO $ readIORef peerRef
-          peerShutdownM peer
-          liftIO $ putStrLn "Network shutdown: disconnect packets sent."
-        else do
-          peer <- liftIO $ readIORef peerRef
-          localState <- liftIO $ readIORef localStateRef
-          now <- liftIO getMonoTimeIO
+  -- Network tick: receive, process, broadcast, send
+  ((events, peer'), netSt') <-
+    runNetT (peerTick [(stateChannel, encoded)] (dsPeer state)) (dsNet state)
 
-          -- Encode local state to broadcast
-          let encoded = serialize localState
+  -- Pure event processing
+  now <- getMonoTimeIO
+  let (peers', peer'') = processEvents now events (dsPeers state) peer'
 
-          -- Single call: receive, process, broadcast, send
-          (events, peer') <- peerTick [(stateChannel, encoded)] peer
+  -- Log notable events
+  mapM_ logEvent events
 
-          -- Handle events, updating both peer map and peer state (for mesh sends)
-          (peers', peer'') <- liftIO $ handleEvents peers peer' now events
+  -- Update shutdown ref for cleanup
+  writeIORef shutdownRef (peer'', netSt')
 
-          -- Update peer ref
-          liftIO $ writeIORef peerRef peer''
+  pure
+    state
+      { dsLocalState = localState',
+        dsPeer = peer'',
+        dsNet = netSt',
+        dsPeers = peers'
+      }
 
-          -- Update shared state for render thread
-          liftIO $ writeIORef sharedNetRef $ SharedNetState peers' (Map.size peers')
+-- | Pure fold over peer events, updating the peers map and peer state.
+processEvents ::
+  MonoTime ->
+  [PeerEvent] ->
+  Map PeerId PlayerState ->
+  NetPeer ->
+  (Map PeerId PlayerState, NetPeer)
+processEvents now events peers peer =
+  foldl' (processEvent now) (peers, peer) events
 
-          liftIO $ threadDelay netTickUs
-          go peers'
+-- | Handle a single peer event (pure).
+processEvent ::
+  MonoTime ->
+  (Map PeerId PlayerState, NetPeer) ->
+  PeerEvent ->
+  (Map PeerId PlayerState, NetPeer)
+processEvent now (peers, peer) = \case
+  PeerConnected pid _dir ->
+    -- Send existing peer list to new peer for mesh introduction
+    let existingPeers = filter (/= pid) (peerConnectedIds peer)
+        peerAddrs = mapMaybe peerIdToPeerAddr existingPeers
+        encoded = encodePeerAddrs peerAddrs
+        peer' = case peerSend pid meshChannel encoded now peer of
+          Left _ -> peer
+          Right p -> p
+     in (Map.insert pid defaultPlayerState peers, peer')
+  PeerDisconnected pid _reason ->
+    (Map.delete pid peers, peer)
+  PeerMessage _pid ch dat
+    | ch == meshChannel ->
+        case decodePeerAddrs dat of
+          Left _ -> (peers, peer)
+          Right addrs ->
+            let known = peerConnectedIds peer
+                localAddr = peerLocalAddr peer
+                newPeerIds =
+                  [ peerIdFromAddr sa
+                  | addr <- addrs,
+                    let sa = peerAddrToSockAddr addr,
+                    peerIdFromAddr sa `notElem` known,
+                    sa /= localAddr
+                  ]
+                peer' = foldl' (\p newPid -> peerConnect newPid now p) peer newPeerIds
+             in (peers, peer')
+  PeerMessage pid _ch dat ->
+    case deserialize dat of
+      Left _ -> (peers, peer)
+      Right ps -> (Map.insert pid ps peers, peer)
+  PeerMigrated oldPid newPid ->
+    case Map.lookup oldPid peers of
+      Nothing -> (peers, peer)
+      Just ps -> (Map.insert newPid ps $ Map.delete oldPid peers, peer)
 
-    handleEvents peerMap peer now = foldM (handleEvent now) (peerMap, peer)
+-- | Log notable peer events.
+logEvent :: PeerEvent -> IO ()
+logEvent = \case
+  PeerConnected pid dir ->
+    putStrLn $ "Connected: " ++ show pid ++ " (" ++ show dir ++ ")"
+  PeerDisconnected pid reason ->
+    putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
+  PeerMigrated oldPid newPid ->
+    putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
+  _ -> pure ()
 
-    handleEvent now (peerMap, peer) = \case
-      PeerConnected pid dir -> do
-        putStrLn $ "Connected: " ++ show pid ++ " (" ++ show dir ++ ")"
-        -- Send existing peer list to the new peer for mesh introduction
-        let existingPeers = filter (/= pid) (peerConnectedIds peer)
-            peerAddrs = mapMaybe peerIdToPeerAddr existingPeers
-            encoded = encodePeerAddrs peerAddrs
-            peer' = case peerSend pid meshChannel encoded now peer of
-              Left _ -> peer
-              Right p -> p
-        pure (Map.insert pid defaultPlayerState peerMap, peer')
-      PeerDisconnected pid reason -> do
-        putStrLn $ "Disconnected: " ++ show pid ++ " (" ++ show reason ++ ")"
-        pure (Map.delete pid peerMap, peer)
-      PeerMessage pid ch dat
-        | ch == meshChannel ->
-            -- Mesh peer introduction: deserialize peer addresses and connect
-            case decodePeerAddrs dat of
-              Left err -> do
-                putStrLn $ "Mesh deserialize error from " ++ show pid ++ ": " ++ err
-                pure (peerMap, peer)
-              Right addrs -> do
-                let known = peerConnectedIds peer
-                    localAddr = peerLocalAddr peer
-                    newPeers =
-                      [ peerIdFromAddr sa
-                      | addr <- addrs,
-                        let sa = peerAddrToSockAddr addr,
-                        peerIdFromAddr sa `notElem` known,
-                        sa /= localAddr
-                      ]
-                    peer' = foldl' (\p newPid -> peerConnect newPid now p) peer newPeers
-                if null newPeers
-                  then pure ()
-                  else putStrLn $ "Mesh: connecting to " ++ show (length newPeers) ++ " new peer(s)"
-                pure (peerMap, peer')
-      PeerMessage pid _ch dat ->
-        case deserialize dat of
-          Left err -> do
-            putStrLn $ "Deserialize error from " ++ show pid ++ ": " ++ err
-            pure (peerMap, peer)
-          Right ps -> pure (Map.insert pid ps peerMap, peer)
-      PeerMigrated oldPid newPid -> do
-        putStrLn $ "Migrated: " ++ show oldPid ++ " -> " ++ show newPid
-        pure (maybe (peerMap, peer) (\ps -> (Map.insert newPid ps $ Map.delete oldPid peerMap, peer)) (Map.lookup oldPid peerMap))
-
--- | Encode a list of PeerAddr for mesh introduction.
-encodePeerAddrs :: [PeerAddr] -> BS.ByteString
-encodePeerAddrs addrs =
-  let count = fromIntegral (length addrs) :: Word16
-   in serialize count <> mconcat (map serialize addrs)
-
--- | Decode a list of PeerAddr from mesh introduction message.
-decodePeerAddrs :: BS.ByteString -> Either String [PeerAddr]
-decodePeerAddrs bs
-  | BS.length bs < 2 = Left "buffer too short for count"
-  | otherwise = do
-      let countBs = BS.take 2 bs
-          addrsBs = BS.drop 2 bs
-      count <- deserialize countBs :: Either String Word16
-      decodeN (fromIntegral count :: Int) addrsBs []
-  where
-    addrSize = sizeOf (undefined :: PeerAddr)
-    decodeN 0 _ acc = Right (reverse acc)
-    decodeN n remaining acc
-      | BS.length remaining < addrSize = Left "buffer too short for PeerAddr"
-      | otherwise = do
-          addr <- deserialize (BS.take addrSize remaining)
-          decodeN (n - 1) (BS.drop addrSize remaining) (addr : acc)
-
--- | Parse command line args: [localPort] [connectToPort]
-parseArgs :: [String] -> (Word16, Maybe Word16)
-parseArgs [] = (defaultPort, Nothing)
-parseArgs [p] = (fromMaybe defaultPort (readMaybe p), Nothing)
-parseArgs (p : t : _) = (fromMaybe defaultPort (readMaybe p), readMaybe t)
+-- | Shutdown: send disconnect packets and wait for delivery.
+shutdown :: IORef (NetPeer, NetState) -> IO ()
+shutdown ref = do
+  (peer, netSt) <- readIORef ref
+  _ <- runNetT (peerShutdownM peer) netSt
+  putStrLn "Network shutdown: disconnect packets sent."
+  threadDelay shutdownDelayUs
+  putStrLn "Shutdown complete."
 
 -- | Render the demo.
-render :: IORef SharedNetState -> DemoState -> IO Picture
-render sharedNetRef state = do
-  netState <- readIORef sharedNetRef
+render :: DemoState -> IO Picture
+render state =
   pure $
     Pictures $
       -- Draw local player (green)
@@ -316,7 +273,7 @@ render sharedNetRef state = do
         ++
         -- Draw peer players
         [ drawPlayer col ps False
-        | (col, (_, ps)) <- zip (cycle remotePlayerColors) (Map.toList (snsPeers netState))
+        | (col, (_, ps)) <- zip (cycle remotePlayerColors) (Map.toList (dsPeers state))
         ]
         ++
         -- Draw HUD
@@ -329,7 +286,7 @@ render sharedNetRef state = do
             Scale 0.10 0.10 $
               Color (greyN 0.5) $
                 Text $
-                  "Peers: " ++ show (snsPeerCount netState),
+                  "Peers: " ++ show (Map.size (dsPeers state)),
           Translate hudLeftMargin (hudTopOffset - hudLineSpacing * 2) $
             Scale 0.10 0.10 $
               Color (greyN 0.5) $
@@ -371,13 +328,32 @@ handleInput event state =
         _ -> input
    in pure state {dsLocalInput = input'}
 
--- | Update the demo state (render thread).
-update :: IORef PlayerState -> IORef SharedNetState -> Float -> DemoState -> IO DemoState
-update localStateRef _sharedNetRef dt state = do
-  -- Update local physics
-  let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
+-- | Encode a list of PeerAddr for mesh introduction.
+encodePeerAddrs :: [PeerAddr] -> BS.ByteString
+encodePeerAddrs addrs =
+  let count = fromIntegral (length addrs) :: Word16
+   in serialize count <> mconcat (map serialize addrs)
 
-  -- Share with network thread
-  writeIORef localStateRef localState'
+-- | Decode a list of PeerAddr from mesh introduction message.
+decodePeerAddrs :: BS.ByteString -> Either String [PeerAddr]
+decodePeerAddrs bs
+  | BS.length bs < 2 = Left "buffer too short for count"
+  | otherwise = do
+      let countBs = BS.take 2 bs
+          addrsBs = BS.drop 2 bs
+      count <- deserialize countBs :: Either String Word16
+      decodeN (fromIntegral count :: Int) addrsBs []
+  where
+    addrSize = sizeOf (undefined :: PeerAddr)
+    decodeN 0 _ acc = Right (reverse acc)
+    decodeN n remaining acc
+      | BS.length remaining < addrSize = Left "buffer too short for PeerAddr"
+      | otherwise = do
+          addr <- deserialize (BS.take addrSize remaining)
+          decodeN (n - 1) (BS.drop addrSize remaining) (addr : acc)
 
-  pure state {dsLocalState = localState'}
+-- | Parse command line args: [localPort] [connectToPort]
+parseArgs :: [String] -> (Word16, Maybe Word16)
+parseArgs [] = (defaultPort, Nothing)
+parseArgs [p] = (fromMaybe defaultPort (readMaybe p), Nothing)
+parseArgs (p : t : _) = (fromMaybe defaultPort (readMaybe p), readMaybe t)
