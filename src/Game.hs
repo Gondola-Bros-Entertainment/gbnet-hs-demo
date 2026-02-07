@@ -32,9 +32,7 @@ module Game
 where
 
 import Data.Word (Word16, Word32)
-import Foreign.Ptr (plusPtr)
-import GBNet.Peer (PeerId (..), unPeerId)
-import GBNet.Serialize.FastTH (deriveStorable)
+import GBNet (PeerId (..), deriveStorable)
 import Network.Socket (SockAddr (..))
 
 -- | Tick rate in Hz.

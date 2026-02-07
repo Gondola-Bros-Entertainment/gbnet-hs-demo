@@ -24,8 +24,8 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Word (Word16)
 import qualified Data.ByteString as BS
+import Foreign.Storable (sizeOf)
 import GBNet
-import GBNet.Peer (npLocalAddr)
 import Game hiding (defaultPort)
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
@@ -132,11 +132,9 @@ main = do
   let bindAddr = anyAddr localPort
       -- Channel 0: Unreliable for position updates (fire and forget)
       -- Channel 1: Reliable for mesh peer introduction
-      unreliableChannel = defaultChannelConfig {ccDeliveryMode = Unreliable}
-      reliableChannel = defaultChannelConfig {ccDeliveryMode = ReliableOrdered}
       config =
         defaultNetworkConfig
-          { ncChannelConfigs = [unreliableChannel, reliableChannel],
+          { ncChannelConfigs = [unreliableConfig, reliableOrderedConfig],
             ncSendRate = 1000.0,
             ncMaxPacketRate = 1000.0
           }
@@ -150,7 +148,7 @@ main = do
       exitFailure
     Right (peer, sock) -> do
       -- Create NetState from the peer's socket (spawns receive thread)
-      netState <- newNetState sock (npLocalAddr peer)
+      netState <- newNetState sock (peerLocalAddr peer)
 
       -- Connect to target if specified
       let peer' = case connectTo of
@@ -253,7 +251,7 @@ networkLoop localStateRef sharedNetRef peerRef shutdownRef = go Map.empty
                 pure (peerMap, peer)
               Right addrs -> do
                 let known = peerConnectedIds peer
-                    localAddr = npLocalAddr peer
+                    localAddr = peerLocalAddr peer
                     newPeers =
                       [ peerIdFromAddr sa
                       | addr <- addrs,
