@@ -39,25 +39,24 @@ Two modules:
 | `Game` | Shared types (`PlayerState`, `PeerAddr`), movement physics, TH-derived serialization |
 | `Main` | Gloss window, network thread, mesh introduction, event handling |
 
-The network thread runs inside `NetT IO` and calls `peerTick` once per
-frame -- a single function that receives, processes, broadcasts, and
-sends in one step:
+Networking runs inside Gloss's `playIO` update callback via `runNetT`.
+Each frame calls `peerTick` once -- a single function that receives,
+processes, broadcasts, and sends in one step:
 
 ```haskell
-networkLoop :: IORef PlayerState -> ... -> NetT IO ()
-networkLoop localStateRef ... = go Map.empty
-  where
-    go peers = do
-      peer <- liftIO $ readIORef peerRef
-      localState <- liftIO $ readIORef localStateRef
-      let encoded = toBytes (bitSerialize localState empty)
+update :: Float -> DemoState -> IO DemoState
+update dt state = do
+  let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
+      encoded = serialize localState'
 
-      -- Single call: receive, process, broadcast, send
-      (events, peer') <- peerTick [(stateChannel, encoded)] peer
+  -- Single call: receive, process, broadcast, send
+  ((events, peer'), netSt') <-
+    runNetT (peerTick [(stateChannel, encoded)] (dsPeer state)) (dsNet state)
 
-      -- Handle events and update peer map
-      (peers', peer'') <- liftIO $ handleEvents peers peer' now events
-      ...
+  -- Pure event processing (no IO needed)
+  now <- getMonoTimeIO
+  let (peers', peer'') = processEvents now events (dsPeers state) peer'
+  ...
 ```
 
 ### Channels

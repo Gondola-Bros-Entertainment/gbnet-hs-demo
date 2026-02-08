@@ -11,7 +11,7 @@
 --   gbnet-demo              -- Binds to port 7777
 --   gbnet-demo 7778         -- Binds to port 7778
 --   gbnet-demo 7778 7777    -- Binds to 7778, connects to peer on 7777
-module Main where
+module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
@@ -344,7 +344,7 @@ decodePeerAddrs bs
       count <- deserialize countBs :: Either String Word16
       decodeN (fromIntegral count :: Int) addrsBs []
   where
-    addrSize = sizeOf (undefined :: PeerAddr)
+    addrSize = sizeOf (PeerAddr 0 0)
     decodeN 0 _ acc = Right (reverse acc)
     decodeN n remaining acc
       | BS.length remaining < addrSize = Left "buffer too short for PeerAddr"
