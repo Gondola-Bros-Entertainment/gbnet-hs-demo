@@ -25,7 +25,7 @@ executable gbnet-demo
   hs-source-dirs:   src
   build-depends:
       base          >= 4.16 && < 5
-    , gbnet-hs       >= 0.1 && < 0.2
+    , gbnet-hs       >= 0.2 && < 0.3
     , bytestring    >= 0.11 && < 0.13
     , gloss         >= 1.13 && < 1.15
     , containers    >= 0.6  && < 0.8

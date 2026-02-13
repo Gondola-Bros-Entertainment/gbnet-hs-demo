@@ -23,8 +23,8 @@ WASD to move. Green square is you; coloured squares are remote peers.
 
 ## Building
 
-Requires GHC 9.6+ and a local checkout of `gbnet-hs` (referenced via
-`cabal.project`).
+Requires GHC 9.6+ and [gbnet-hs](https://hackage.haskell.org/package/gbnet-hs)
+(pulled from Hackage automatically).
 
 ```bash
 cabal build
@@ -46,16 +46,16 @@ processes, broadcasts, and sends in one step:
 ```haskell
 update :: Float -> DemoState -> IO DemoState
 update dt state = do
-  let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
-      encoded = serialize localState'
+  let movedState = applyInput dt (dsLocalInput state) (dsLocalState state)
+      encoded = serialize movedState
 
   -- Single call: receive, process, broadcast, send
-  ((events, peer'), netSt') <-
+  ((events, tickedPeer), tickedNet) <-
     runNetT (peerTick [(stateChannel, encoded)] (dsPeer state)) (dsNet state)
 
   -- Pure event processing (no IO needed)
   now <- getMonoTimeIO
-  let (peers', peer'') = processEvents now events (dsPeers state) peer'
+  let (updatedPeers, processedPeer) = processEvents now events (dsPeers state) tickedPeer
   ...
 ```
 

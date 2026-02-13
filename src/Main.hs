@@ -15,13 +15,13 @@ module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
+import qualified Data.ByteString as BS
 import Data.IORef
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Word (Word16)
-import qualified Data.ByteString as BS
 import Foreign.Storable (sizeOf)
 import GBNet
 import Game hiding (defaultPort)
@@ -140,7 +140,7 @@ main = do
     Right (peer, sock) -> do
       netSt <- newNetState sock (peerLocalAddr peer)
 
-      let peer' = case connectTo of
+      let connectedPeer = case connectTo of
             Nothing -> peer
             Just targetPort ->
               let targetAddr = localhost targetPort
@@ -148,13 +148,13 @@ main = do
                in peerConnect targetPid now peer
 
       -- Single IORef for shutdown cleanup (playIO doesn't return final state)
-      shutdownRef <- newIORef (peer', netSt)
+      shutdownRef <- newIORef (connectedPeer, netSt)
 
       playIO
         (InWindow ("gbnet-demo :" ++ show localPort) (windowWidthInt, windowHeightInt) (100, 100))
         (makeColorI 25 25 38 255)
         tickRateHz
-        (initialDemoState localPort peer' netSt)
+        (initialDemoState localPort connectedPeer netSt)
         render
         handleInput
         (update shutdownRef)
@@ -164,29 +164,29 @@ main = do
 update :: IORef (NetPeer, NetState) -> Float -> DemoState -> IO DemoState
 update shutdownRef dt state = do
   -- Apply local physics
-  let localState' = applyInput dt (dsLocalInput state) (dsLocalState state)
-      encoded = serialize localState'
+  let movedState = applyInput dt (dsLocalInput state) (dsLocalState state)
+      encoded = serialize movedState
 
   -- Network tick: receive, process, broadcast, send
-  ((events, peer'), netSt') <-
+  ((events, tickedPeer), tickedNet) <-
     runNetT (peerTick [(stateChannel, encoded)] (dsPeer state)) (dsNet state)
 
   -- Pure event processing
   now <- getMonoTimeIO
-  let (peers', peer'') = processEvents now events (dsPeers state) peer'
+  let (updatedPeers, processedPeer) = processEvents now events (dsPeers state) tickedPeer
 
   -- Log notable events
   mapM_ logEvent events
 
   -- Update shutdown ref for cleanup
-  writeIORef shutdownRef (peer'', netSt')
+  writeIORef shutdownRef (processedPeer, tickedNet)
 
   pure
     state
-      { dsLocalState = localState',
-        dsPeer = peer'',
-        dsNet = netSt',
-        dsPeers = peers'
+      { dsLocalState = movedState,
+        dsPeer = processedPeer,
+        dsNet = tickedNet,
+        dsPeers = updatedPeers
       }
 
 -- | Pure fold over peer events, updating the peers map and peer state.
@@ -211,10 +211,10 @@ processEvent now (peers, peer) = \case
     let existingPeers = filter (/= pid) (peerConnectedIds peer)
         peerAddrs = mapMaybe peerIdToPeerAddr existingPeers
         encoded = encodePeerAddrs peerAddrs
-        peer' = case peerSend pid meshChannel encoded now peer of
+        sentPeer = case peerSend pid meshChannel encoded now peer of
           Left _ -> peer
           Right p -> p
-     in (Map.insert pid defaultPlayerState peers, peer')
+     in (Map.insert pid defaultPlayerState peers, sentPeer)
   PeerDisconnected pid _reason ->
     (Map.delete pid peers, peer)
   PeerMessage _pid ch dat
@@ -231,8 +231,8 @@ processEvent now (peers, peer) = \case
                     peerIdFromAddr sa `notElem` known,
                     sa /= localAddr
                   ]
-                peer' = foldl' (\p newPid -> peerConnect newPid now p) peer newPeerIds
-             in (peers, peer')
+                meshPeer = foldl' (\p newPid -> peerConnect newPid now p) peer newPeerIds
+             in (peers, meshPeer)
   PeerMessage pid _ch dat ->
     case deserialize dat of
       Left _ -> (peers, peer)
@@ -316,7 +316,7 @@ drawPlayer col ps isLocal =
 handleInput :: Event -> DemoState -> IO DemoState
 handleInput event state =
   let input = dsLocalInput state
-      input' = case event of
+      updatedInput = case event of
         EventKey (Char 'w') Down _ _ -> input {piUp = True}
         EventKey (Char 'w') Up _ _ -> input {piUp = False}
         EventKey (Char 's') Down _ _ -> input {piDown = True}
@@ -326,7 +326,7 @@ handleInput event state =
         EventKey (Char 'd') Down _ _ -> input {piRight = True}
         EventKey (Char 'd') Up _ _ -> input {piRight = False}
         _ -> input
-   in pure state {dsLocalInput = input'}
+   in pure state {dsLocalInput = updatedInput}
 
 -- | Encode a list of PeerAddr for mesh introduction.
 encodePeerAddrs :: [PeerAddr] -> BS.ByteString
